@@ -8,6 +8,8 @@ import (
 	"log/slog"
 
 	// "github.com/kagenti/mcp-gateway/internal/config"
+	"github.com/kagenti/mcp-gateway/internal/mcp-router/guardrails"
+	guardrailsProviders "github.com/kagenti/mcp-gateway/internal/mcp-router/guardrails/providers"
 
 	extProcV3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/kagenti/mcp-gateway/internal/broker"
@@ -27,6 +29,8 @@ type ExtProcServer struct {
 	Logger         *slog.Logger
 	streaming      bool
 	requestHeaders *extProcV3.HttpHeaders
+
+	GuardrailsProviders map[string]guardrails.Provider
 }
 
 // OnConfigChange is used to register the router for config changes
@@ -57,6 +61,16 @@ func (s *ExtProcServer) SetupSessionCache() {
 		s.Logger.Info("Created MCP session ", "sessionID", sessionID, "server", serverName, "host", authority)
 		return sessionID, nil
 	})
+}
+
+// SetupGuardrailsProviders initializes the guardrails providers
+func (s *ExtProcServer) SetupGuardrailsProviders() {
+	slog.Info("Setting up guardrails providers...")
+	s.GuardrailsProviders = make(map[string]guardrails.Provider)
+
+	// FIXME - hardcoded for now, later read from config
+	// See: https://github.com/kagenti/mcp-gateway/issues/192
+	s.GuardrailsProviders["SimplePII"] = guardrailsProviders.NewSimplePIIGuardrailsProvider()
 }
 
 // Process function
@@ -141,7 +155,7 @@ func (s *ExtProcServer) Process(stream extProcV3.ExternalProcessor_ProcessServer
 			}
 			continue
 		case *extProcV3.ProcessingRequest_ResponseBody:
-			responses, _ := s.HandleResponseBody(r.ResponseBody)
+			responses, _ := s.ProcessGuardrailsForResponse(r.ResponseBody)
 			for _, response := range responses {
 				s.Logger.Info(fmt.Sprintf("Sending response body processing instructions to Envoy: %+v", response))
 				if err := stream.Send(response); err != nil {

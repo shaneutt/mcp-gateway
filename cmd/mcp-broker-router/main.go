@@ -311,6 +311,9 @@ func setUpRouter(broker broker.MCPBroker, logger *slog.Logger, jwtManager *sessi
 	// Setup the session cache with proper initialization
 	server.SetupSessionCache()
 
+	// Setup guardrails providers
+	server.SetupGuardrailsProviders()
+
 	extProcV3.RegisterExternalProcessorServer(grpcSrv, server)
 	return grpcSrv, server
 }

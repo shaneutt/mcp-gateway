@@ -3,10 +3,19 @@ package mcprouter
 import (
 	"fmt"
 	"log/slog"
+	"net/http"
 
 	basepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	eppb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	typepb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 )
+
+// passthroughResponse is an empty response to signal to continue processing.
+var passthroughResponse = &eppb.ProcessingResponse{
+	Response: &eppb.ProcessingResponse_ResponseBody{
+		ResponseBody: &eppb.BodyResponse{},
+	},
+}
 
 // extractHelperSessionFromBackend extracts the helper session ID from a backend session ID
 // Returns empty string if not a backend session ID
@@ -88,37 +97,70 @@ func (s *ExtProcServer) HandleResponseHeaders(
 	}, nil
 }
 
-// HandleResponseBody handles response bodies.
-func (s *ExtProcServer) HandleResponseBody(
-	body *eppb.HttpBody) ([]*eppb.ProcessingResponse, error) {
-	slog.Info(fmt.Sprintf("[EXT-PROC] Processing response body... (size: %d, end_of_stream: %t)",
-		len(body.GetBody()), body.GetEndOfStream()))
+// -----------------------------------------------------------------------------
+// Response Handling - Guardrails Response Processor
+// -----------------------------------------------------------------------------
 
-	// slog the response body content if it's not too large
-	if len(body.GetBody()) > 0 && len(body.GetBody()) < 1000 {
-		slog.Info(fmt.Sprintf("[EXT-PROC] Response body content: %s", string(body.GetBody())))
+// ProcessGuardrailsForResponse processes the response with the configured
+// guardrail providers.
+func (s *ExtProcServer) ProcessGuardrailsForResponse(
+	httpBody *eppb.HttpBody) ([]*eppb.ProcessingResponse, error) {
+	body := httpBody.GetBody()
+
+	slog.Info(fmt.Sprintf("[EXT-PROC] Processing %d guardrails providers for response (size: %d, end_of_stream: %t)",
+		len(s.GuardrailsProviders), len(body), httpBody.GetEndOfStream()))
+
+	for providerName, provider := range s.GuardrailsProviders {
+		slog.Info(fmt.Sprintf("[EXT-PROC] Processing guardrails provider %s for response", providerName))
+
+		flagged, details, err := provider.ProcessResponse(body)
+		if err != nil {
+			slog.Error("[EXT-PROC] Guardrails provider error", "error", err, "provider", providerName)
+			return extProcErrorResponse(providerName, err), nil
+		}
+
+		if flagged {
+			slog.Info("[EXT-PROC] Guardrails provider flagged the response")
+			return extProcFlaggedResponse(providerName, details), nil
+		}
 	}
 
-	return []*eppb.ProcessingResponse{
-		{
-			Response: &eppb.ProcessingResponse_ResponseBody{
-				ResponseBody: &eppb.BodyResponse{},
-			},
-		},
-	}, nil
+	slog.Info("[EXT-PROC] Response accepted by guardrails providers")
+	return []*eppb.ProcessingResponse{passthroughResponse}, nil
 }
 
-// HandleResponseTrailers handles response trailers.
-func (s *ExtProcServer) HandleResponseTrailers(
-	_ *eppb.HttpTrailers,
-) ([]*eppb.ProcessingResponse, error) {
-	slog.Info("[EXT-PROC] Processing response trailers...")
+// -----------------------------------------------------------------------------
+// Response Handling - Guardrails ExtProc Utilities
+// -----------------------------------------------------------------------------
 
+// extProcErrorResponse constructs an ext_proc error response for guardrails
+// provider errors.
+func extProcErrorResponse(providerName string, err error) []*eppb.ProcessingResponse {
+	details := fmt.Sprintf("guardrails provider %s error: %s", providerName, err)
 	return []*eppb.ProcessingResponse{
 		{
-			Response: &eppb.ProcessingResponse_ResponseTrailers{
-				ResponseTrailers: &eppb.TrailersResponse{},
-			},
-		},
-	}, nil
+			Response: &eppb.ProcessingResponse_ImmediateResponse{
+				ImmediateResponse: &eppb.ImmediateResponse{
+					Status: &typepb.HttpStatus{
+						Code: typepb.StatusCode(http.StatusServiceUnavailable),
+					},
+					Body:    []byte(details),
+					Details: details,
+				}}}}
+}
+
+// extProcFlaggedResponse constructs an ext_proc response for guardrails for
+// flagged responses.
+func extProcFlaggedResponse(providerName, details string) []*eppb.ProcessingResponse {
+	details = fmt.Sprintf("Response flagged by guardrails provider %s: %s", providerName, details)
+	return []*eppb.ProcessingResponse{
+		{
+			Response: &eppb.ProcessingResponse_ImmediateResponse{
+				ImmediateResponse: &eppb.ImmediateResponse{
+					Status: &typepb.HttpStatus{
+						Code: typepb.StatusCode(http.StatusUnavailableForLegalReasons),
+					},
+					Body:    []byte(details),
+					Details: details,
+				}}}}
 }
